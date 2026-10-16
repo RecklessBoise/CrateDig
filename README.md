@@ -44,7 +44,7 @@ CrateDig is an **instrument**: load it on an instrument/MIDI track so the previe
 
 ## Build from source
 
-Requirements: CMake ≥ 3.22, a C++20 compiler (Xcode / Command Line Tools on macOS, Visual Studio 2022 on Windows). JUCE is fetched automatically.
+Requirements: CMake ≥ 3.22, a C++20 compiler (Xcode / Command Line Tools on macOS, Visual Studio 2022 or newer on Windows). JUCE is fetched automatically.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
