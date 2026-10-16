@@ -145,7 +145,11 @@ public:
         {
             auto dir = juce::File::createTempFile ("cratedig-ytdlp");
             dir.createDirectory();
+           #if JUCE_WINDOWS
+            auto fake = dir.getChildFile ("my-yt-dlp.exe"); // findTool appends .exe on Windows
+           #else
             auto fake = dir.getChildFile ("my-yt-dlp");
+           #endif
             fake.replaceWithText ("#!/bin/sh\necho hello\n");
 
             YtDlp custom (fake);
