@@ -1,5 +1,5 @@
 // Renders the plugin editor to PNG files (used for README screenshots and layout checks).
-// Usage: CrateDigSnapshot <output-folder> [--dig]
+// Usage: CrateDigSnapshot <output-folder> [--dig [path/to/yt-dlp]]
 
 #include "PluginProcessor.h"
 
@@ -26,13 +26,19 @@ public:
         folder.createDirectory();
 
         processor.reset (static_cast<CrateDigProcessor*> (createPluginFilter()));
-        cratedig::archive::DigFilters filters;
-        filters.genre = "Jazz";
-        filters.decade = 1920;
+        cratedig::youtube::DigFilters filters;
+        filters.genre = "Jazz Funk";
+        filters.decade = 1970;
         processor->setFilters (filters);
 
-        if (args.contains ("--dig"))
-            processor->dig();
+        if (auto digIndex = args.indexOf ("--dig"); digIndex >= 0)
+        {
+            if (args[digIndex + 1].isNotEmpty())
+                processor->setCustomYtDlp (juce::File (args[digIndex + 1].unquoted()));
+
+            processor->search();
+            stage = Stage::searching;
+        }
 
         startedAt = juce::Time::getMillisecondCounter();
         startTimer (200);
@@ -49,18 +55,27 @@ private:
     {
         auto elapsed = juce::Time::getMillisecondCounter() - startedAt;
 
+        if (processor->isBusy() && elapsed < 120000)
+            return;
+
+        if (stage == Stage::searching)
+        {
+            std::cout << processor->getStatus() << std::endl;
+            processor->listen();
+            stage = Stage::listening;
+            return;
+        }
+
         if (editor == nullptr)
         {
-            if (processor->isBusy() && elapsed < 60000)
-                return;
-
             std::cout << processor->getStatus() << std::endl;
 
-            if (processor->hasSample())
+            if (processor->isSelectedLoaded())
             {
-                auto total = processor->getCurrent().audio->getNumSamples();
+                processor->stop();
+                auto total = processor->getLoaded().audio->getNumSamples();
                 processor->setSelection ({ total / 5, total / 5 + total / 12 });
-                processor->setStatus ("Found it - drag the chop into your DAW");
+                processor->setStatus ("Previewing - Download or drag the chop to keep it");
             }
 
             editor.reset (processor->createEditor());
@@ -89,6 +104,8 @@ private:
     juce::File folder;
     std::unique_ptr<CrateDigProcessor> processor;
     std::unique_ptr<juce::AudioProcessorEditor> editor;
+    enum class Stage { idle, searching, listening };
+    Stage stage = Stage::idle;
     juce::uint32 startedAt = 0;
     int shot = 0;
 };

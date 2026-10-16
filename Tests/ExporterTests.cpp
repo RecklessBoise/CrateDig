@@ -19,20 +19,26 @@ public:
             expectEquals (exporter::sanitiseFileName (juce::String::repeatedString ("a", 300)).length(), 120);
         }
 
-        beginTest ("Base name includes artist, title, year, BPM and key");
+        beginTest ("Base name from YouTube metadata");
         {
             SampleInfo info;
-            info.identifier = "id";
-            info.title = "Mississippi Mildred";
-            info.creator = "Jelly-Roll Morton, Henry Allen";
-            info.year = 1930;
+            info.id = "abcdefghijk";
+            info.title = "Love Life";
+            info.channel = "Daniel Janin - Topic";
+            info.year = 1974;
 
             expectEquals (exporter::makeBaseName (info, 118.6, "Bb"),
-                          juce::String ("Jelly-Roll Morton - Mississippi Mildred (1930) [119 BPM, Bb]"));
+                          juce::String ("Daniel Janin - Love Life (1974) [119 BPM, Bb]"));
 
-            info.creator = {};
+            info.title = "Franceola - Mighty Good Man - 1974 Maestro";
+            info.channel = "THE SOULPARANOS";
+            expectEquals (exporter::makeBaseName (info, 0.0, {}),
+                          juce::String ("Franceola - Mighty Good Man - 1974 Maestro"));
+
+            info.title = {};
+            info.channel = {};
             info.year = 0;
-            expectEquals (exporter::makeBaseName (info, 0.0, {}), juce::String ("Mississippi Mildred"));
+            expectEquals (exporter::makeBaseName (info, 0.0, {}), juce::String ("abcdefghijk"));
         }
 
         beginTest ("Region suffix only for partial regions");

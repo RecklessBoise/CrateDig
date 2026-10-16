@@ -10,7 +10,7 @@ namespace cratedig::exporter
 /** Removes characters that are illegal or awkward in file names and collapses whitespace. */
 juce::String sanitiseFileName (const juce::String& name, int maxLength = 120);
 
-/** "Artist - Title (1931) [120 BPM, Am]" */
+/** "Artist - Title (1974) [120 BPM, Am]"; the channel is only added when the title lacks the artist. */
 juce::String makeBaseName (const SampleInfo& info, double bpm, const juce::String& key);
 
 /** Suffix describing a region, e.g. " (chop 12.3s-18.0s)". Empty when the region is the whole buffer. */

@@ -3,10 +3,44 @@
 #include "Core/Exporter.h"
 #include "PluginEditor.h"
 
+using namespace cratedig;
+
 namespace
 {
     constexpr int requestFromSelection = -2;
     constexpr int noRequest = -1;
+
+    /** Machine-wide settings shared by every CrateDig instance (currently the yt-dlp location). */
+    std::unique_ptr<juce::PropertiesFile> openGlobalSettings()
+    {
+        juce::PropertiesFile::Options options;
+        options.applicationName = "CrateDig";
+        options.filenameSuffix = ".settings";
+        options.folderName = "CrateDig";
+        options.osxLibrarySubFolder = "Application Support";
+        return std::make_unique<juce::PropertiesFile> (options);
+    }
+
+    void saveList (juce::ValueTree& parent, const juce::String& name, const std::vector<SampleInfo>& list)
+    {
+        juce::ValueTree tree (name);
+
+        for (auto& item : list)
+            tree.appendChild (item.toValueTree(), nullptr);
+
+        parent.appendChild (tree, nullptr);
+    }
+
+    std::vector<SampleInfo> loadList (const juce::ValueTree& parent, const juce::String& name)
+    {
+        std::vector<SampleInfo> list;
+
+        for (auto item : parent.getChildWithName (name))
+            if (auto info = SampleInfo::fromValueTree (item); youtube::isValidVideoId (info.id))
+                list.push_back (info);
+
+        return list;
+    }
 } // namespace
 
 CrateDigProcessor::CrateDigProcessor()
@@ -16,9 +50,21 @@ CrateDigProcessor::CrateDigProcessor()
     gainParam = parameters.getRawParameterValue ("gain");
     loopParam = parameters.getRawParameterValue ("loop");
 
+    if (auto settings = openGlobalSettings())
+        digger.setCustomYtDlp (juce::File (settings->getValue ("ytdlpPath")));
+
     digger.onStatus = [this] (const juce::String& text) { setStatus (text); };
-    digger.onError = [this] (const juce::String& text) { setStatus (text, true); };
-    digger.onLoaded = [this] (const cratedig::LoadedSample& sample) { handleLoaded (sample); };
+    digger.onError = [this] (const juce::String& text)
+    {
+        downloadWhenLoaded = false;
+        setStatus (text, true);
+    };
+    digger.onResults = [this] (const juce::String& query, const std::vector<SampleInfo>& found) { handleResults (query, found); };
+    digger.onLoaded = [this] (const LoadedSample& sample) { handleLoaded (sample); };
+
+    status = digger.isYtDlpAvailable() ? "Hit DIG for a random record, or type a search"
+                                       : YtDlp::installHint();
+    statusIsError = ! digger.isYtDlpAvailable();
 }
 
 CrateDigProcessor::~CrateDigProcessor()
@@ -151,21 +197,18 @@ void CrateDigProcessor::getStateInformation (juce::MemoryBlock& destData)
     juce::ValueTree session ("Session");
     session.setProperty ("width", editorSize.x, nullptr);
     session.setProperty ("height", editorSize.y, nullptr);
+    session.setProperty ("text", filters.text, nullptr);
     session.setProperty ("genre", filters.genre, nullptr);
     session.setProperty ("decade", filters.decade, nullptr);
-    session.setProperty ("publicDomainOnly", filters.publicDomainOnly, nullptr);
+    session.setProperty ("query", lastQuery, nullptr);
     session.setProperty ("selectionStart", selectionStart.load(), nullptr);
     session.setProperty ("selectionEnd", selectionEnd.load(), nullptr);
 
-    if (current.info.isValid())
-        session.appendChild (current.info.toValueTree().setProperty ("current", true, nullptr), nullptr);
+    if (selected.isValid())
+        session.appendChild (selected.toValueTree().setProperty ("selected", true, nullptr), nullptr);
 
-    juce::ValueTree historyTree ("History");
-
-    for (auto& item : history)
-        historyTree.appendChild (item.toValueTree(), nullptr);
-
-    session.appendChild (historyTree, nullptr);
+    saveList (session, "Results", results);
+    saveList (session, "History", history);
 
     state.removeChild (state.getChildWithName ("Session"), nullptr);
     state.appendChild (session, nullptr);
@@ -189,35 +232,32 @@ void CrateDigProcessor::setStateInformation (const void* data, int sizeInBytes)
     if (! session.isValid())
         return;
 
-    const juce::ScopedLock sl (stateLock);
+    SampleInfo restoredSelection;
 
-    editorSize = { juce::jlimit (CrateDigEditor::minWidth, CrateDigEditor::maxWidth, (int) session.getProperty ("width", editorSize.x)),
-                   juce::jlimit (CrateDigEditor::minHeight, CrateDigEditor::maxHeight, (int) session.getProperty ("height", editorSize.y)) };
-    filters.genre = session.getProperty ("genre").toString();
-    filters.decade = (int) session.getProperty ("decade", 0);
-    filters.publicDomainOnly = (bool) session.getProperty ("publicDomainOnly", false);
-
-    history.clear();
-
-    for (auto item : session.getChildWithName ("History"))
-        if (auto info = cratedig::SampleInfo::fromValueTree (item); info.isValid())
-            history.push_back (info);
-
-    auto savedSelection = juce::Range<int> ((int) session.getProperty ("selectionStart", 0),
-                                            (int) session.getProperty ("selectionEnd", 0));
-
-    for (auto child : session)
     {
-        if (child.hasType ("Sample") && (bool) child.getProperty ("current", false))
-        {
-            auto info = cratedig::SampleInfo::fromValueTree (child);
+        const juce::ScopedLock sl (stateLock);
 
-            if (info.identifier != current.info.identifier)
-            {
-                setSelection (savedSelection);
-                digger.load (info);
-            }
-        }
+        editorSize = { juce::jlimit (CrateDigEditor::minWidth, CrateDigEditor::maxWidth, (int) session.getProperty ("width", editorSize.x)),
+                       juce::jlimit (CrateDigEditor::minHeight, CrateDigEditor::maxHeight, (int) session.getProperty ("height", editorSize.y)) };
+        filters.text = session.getProperty ("text").toString();
+        filters.genre = session.getProperty ("genre").toString();
+        filters.decade = (int) session.getProperty ("decade", 0);
+        lastQuery = session.getProperty ("query").toString();
+        results = loadList (session, "Results");
+        history = loadList (session, "History");
+
+        for (auto child : session)
+            if (child.hasType ("Sample") && (bool) child.getProperty ("selected", false))
+                restoredSelection = SampleInfo::fromValueTree (child);
+
+        selected = restoredSelection;
+    }
+
+    // Reload the preview only if it is still in the local cache: restoring a project never hits the network.
+    if (restoredSelection.isValid() && restoredSelection.id != loaded.info.id && Digger::isCached (restoredSelection))
+    {
+        setSelection ({ (int) session.getProperty ("selectionStart", 0), (int) session.getProperty ("selectionEnd", 0) });
+        digger.fetch (restoredSelection);
     }
 
     sendChangeMessage();
@@ -231,27 +271,124 @@ void CrateDigProcessor::setStatus (const juce::String& text, bool isError)
     sendChangeMessage();
 }
 
-void CrateDigProcessor::dig()
+void CrateDigProcessor::setCustomYtDlp (const juce::File& file)
+{
+    digger.setCustomYtDlp (file);
+    saveGlobalSettings();
+
+    if (digger.isYtDlpAvailable())
+        setStatus ("yt-dlp ready: " + YtDlp (file).getExecutable().getFullPathName());
+    else
+        setStatus (YtDlp::installHint(), true);
+}
+
+void CrateDigProcessor::saveGlobalSettings()
+{
+    if (auto settings = openGlobalSettings())
+    {
+        settings->setValue ("ytdlpPath", digger.getCustomYtDlp().getFullPathName());
+        settings->saveIfNeeded();
+    }
+}
+
+void CrateDigProcessor::search()
 {
     if (digger.isBusy())
         return;
 
-    setSelection ({});
-    digger.dig (getFilters());
+    digger.search (getFilters());
     sendChangeMessage();
 }
 
-void CrateDigProcessor::loadFromHistory (int index)
+void CrateDigProcessor::handleResults (const juce::String& query, const std::vector<SampleInfo>& found)
 {
-    if (digger.isBusy() || ! juce::isPositiveAndBelow (index, (int) history.size()))
+    {
+        const juce::ScopedLock sl (stateLock);
+        results = found;
+        lastQuery = query;
+    }
+
+    select (found.front());
+    setStatus (juce::String ((int) found.size()) + " results for \"" + query + "\" - press Listen to hear one");
+}
+
+void CrateDigProcessor::selectResult (int index)
+{
+    if (juce::isPositiveAndBelow (index, (int) results.size()))
+        select (results[(size_t) index]);
+}
+
+void CrateDigProcessor::selectHistory (int index)
+{
+    if (juce::isPositiveAndBelow (index, (int) history.size()))
+        select (history[(size_t) index]);
+}
+
+void CrateDigProcessor::select (const SampleInfo& info)
+{
+    if (info.id == selected.id)
         return;
 
+    {
+        const juce::ScopedLock sl (stateLock);
+        selected = info;
+    }
+
+    downloadWhenLoaded = false;
+    stop();
     setSelection ({});
-    digger.load (history[(size_t) index]);
     sendChangeMessage();
 }
 
-void CrateDigProcessor::handleLoaded (const cratedig::LoadedSample& sample)
+bool CrateDigProcessor::isSelectedLoaded() const
+{
+    return loaded.audio != nullptr && selected.isValid() && loaded.info.id == selected.id;
+}
+
+void CrateDigProcessor::listen()
+{
+    if (isSelectedLoaded())
+    {
+        play();
+        return;
+    }
+
+    if (selected.isValid() && ! digger.isBusy())
+    {
+        digger.fetch (selected);
+        sendChangeMessage();
+    }
+}
+
+void CrateDigProcessor::download()
+{
+    if (isSelectedLoaded())
+    {
+        juce::String error;
+        auto file = exportSelection (error);
+
+        if (file.existsAsFile())
+        {
+            setStatus ("Downloaded " + file.getFileName());
+            file.revealToUser();
+        }
+        else
+        {
+            setStatus (error.isNotEmpty() ? error : juce::String ("Export failed"), true);
+        }
+
+        return;
+    }
+
+    if (selected.isValid() && ! digger.isBusy())
+    {
+        downloadWhenLoaded = true;
+        digger.fetch (selected);
+        sendChangeMessage();
+    }
+}
+
+void CrateDigProcessor::handleLoaded (const LoadedSample& sample)
 {
     auto previous = preview; // released after the lock, on this (message) thread
 
@@ -263,16 +400,30 @@ void CrateDigProcessor::handleLoaded (const cratedig::LoadedSample& sample)
     }
 
     previous.reset();
+    loaded = sample;
 
     {
         const juce::ScopedLock sl (stateLock);
-        current = sample;
         addToHistory (sample.info);
     }
 
     // Drop a restored selection that no longer fits.
     if (getSelection().getEnd() > sample.audio->getNumSamples())
         setSelection ({});
+
+    // The user may have picked another card while this one was loading.
+    if (sample.info.id != selected.id)
+    {
+        downloadWhenLoaded = false;
+        setStatus ("Preview ready for \"" + sample.info.title + "\"");
+        return;
+    }
+
+    if (std::exchange (downloadWhenLoaded, false))
+    {
+        download();
+        return;
+    }
 
     juce::String details;
 
@@ -282,14 +433,14 @@ void CrateDigProcessor::handleLoaded (const cratedig::LoadedSample& sample)
     if (sample.key.isNotEmpty())
         details << " - " << sample.key;
 
-    setStatus ("Found it" + details + ". Drag it into your DAW or select a chop.");
+    setStatus ("Previewing" + details + ". Download or drag it to keep it.");
     play();
 }
 
-void CrateDigProcessor::addToHistory (const cratedig::SampleInfo& info)
+void CrateDigProcessor::addToHistory (const SampleInfo& info)
 {
     history.erase (std::remove_if (history.begin(), history.end(),
-                                   [&] (const auto& h) { return h.identifier == info.identifier; }),
+                                   [&] (const auto& h) { return h.id == info.id; }),
                    history.end());
 
     history.insert (history.begin(), info);
@@ -298,13 +449,13 @@ void CrateDigProcessor::addToHistory (const cratedig::SampleInfo& info)
         history.resize ((size_t) maxHistory);
 }
 
-cratedig::archive::DigFilters CrateDigProcessor::getFilters() const
+youtube::DigFilters CrateDigProcessor::getFilters() const
 {
     const juce::ScopedLock sl (stateLock);
     return filters;
 }
 
-void CrateDigProcessor::setFilters (const cratedig::archive::DigFilters& newFilters)
+void CrateDigProcessor::setFilters (const youtube::DigFilters& newFilters)
 {
     const juce::ScopedLock sl (stateLock);
     filters = newFilters;
@@ -335,7 +486,7 @@ void CrateDigProcessor::setSelection (juce::Range<int> range)
 
 juce::Range<int> CrateDigProcessor::getEffectiveSelection() const
 {
-    auto total = current.audio != nullptr ? current.audio->getNumSamples() : 0;
+    auto total = loaded.audio != nullptr ? loaded.audio->getNumSamples() : 0;
     auto sel = getSelection().getIntersectionWith ({ 0, total });
     return sel.getLength() < 2 ? juce::Range<int> (0, total) : sel;
 }
@@ -358,15 +509,15 @@ void CrateDigProcessor::stop()
 
 juce::File CrateDigProcessor::exportSelection (juce::String& error)
 {
-    if (current.audio == nullptr)
+    if (! isSelectedLoaded())
     {
-        error = "Dig a record first";
+        error = "Listen to the track first";
         return {};
     }
 
-    auto baseName = cratedig::exporter::makeBaseName (current.info, current.bpm, current.key);
-    return cratedig::exporter::exportWav (*current.audio, current.sampleRate, getEffectiveSelection(),
-                                          cratedig::exporter::defaultFolder(), baseName, error);
+    auto baseName = exporter::makeBaseName (loaded.info, loaded.bpm, loaded.key);
+    return exporter::exportWav (*loaded.audio, loaded.sampleRate, getEffectiveSelection(),
+                                exporter::defaultFolder(), baseName, error);
 }
 
 //==============================================================================

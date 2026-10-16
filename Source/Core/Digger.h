@@ -1,17 +1,19 @@
 #pragma once
 
-#include "ArchiveApi.h"
+#include "YouTube.h"
+#include "YtDlp.h"
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_events/juce_events.h>
 
 #include <functional>
 #include <memory>
+#include <vector>
 
 namespace cratedig
 {
 
-/** A decoded, analysed record ready for preview and export. */
+/** A decoded, analysed preview ready for playback and export. */
 struct LoadedSample
 {
     SampleInfo info;
@@ -22,8 +24,11 @@ struct LoadedSample
 };
 
 /**
-    Runs all network and decoding work on a background thread:
-    random search on archive.org -> pick the MP3 -> download into the cache -> decode -> analyse.
+    Runs yt-dlp on a background thread. Two separate jobs, both started by the user:
+
+    - search(): asks YouTube for results. No audio is fetched.
+    - fetch():  pulls the audio of ONE chosen video into a temporary preview cache, decodes and analyses it.
+                Nothing reaches the user's library until they press Download or drag the sample out.
 
     Callbacks are always delivered on the message thread.
 */
@@ -33,40 +38,51 @@ public:
     Digger();
     ~Digger() override;
 
-    /** Finds a random record matching the filters. Ignored while busy. */
-    void dig (const archive::DigFilters& filters);
+    /** Path to a yt-dlp chosen by the user (empty = search the usual install folders). */
+    void setCustomYtDlp (const juce::File& file);
+    juce::File getCustomYtDlp() const;
+    bool isYtDlpAvailable() const;
 
-    /** Loads a known record (from the cache when possible). Ignored while busy. */
-    void load (const SampleInfo& info);
+    /** Searches YouTube. Ignored while busy. */
+    void search (const youtube::DigFilters& filters);
+
+    /** Fetches the audio of one video for preview. Ignored while busy. */
+    void fetch (const SampleInfo& info);
+
+    /** True when the preview of this video is already in the cache (no network needed). */
+    static bool isCached (const SampleInfo& info);
 
     bool isBusy() const { return isThreadRunning(); }
     void cancel();
 
+    std::function<void (const juce::String& query, const std::vector<SampleInfo>& results)> onResults;
     std::function<void (const LoadedSample&)> onLoaded;
     std::function<void (const juce::String&)> onError;
     std::function<void (const juce::String&)> onStatus;
 
+    /** Temporary preview cache. Old files are pruned automatically. */
     static juce::File cacheFolder();
 
 private:
     void run() override;
 
-    std::optional<SampleInfo> findRandomRecord (const archive::DigFilters&);
-    bool resolveAudioFile (SampleInfo&);
-    std::optional<LoadedSample> fetchAndDecode (const SampleInfo&);
+    void runSearch (const youtube::DigFilters&);
+    void runFetch (const SampleInfo&);
+    std::optional<LoadedSample> decode (const SampleInfo&, const juce::File&);
 
-    juce::String httpGet (const juce::String& url);
-    bool download (const juce::String& url, const juce::File& destination);
+    static juce::File findCached (const SampleInfo&);
+    static void pruneCache (int filesToKeep);
 
     void postStatus (const juce::String&);
     void postError (const juce::String&);
 
-    enum class Job { dig, load };
+    enum class Job { search, fetch };
 
     juce::CriticalSection jobLock;
-    Job job = Job::dig;
-    archive::DigFilters filters;
+    Job job = Job::search;
+    youtube::DigFilters filters;
     SampleInfo requested;
+    juce::File customYtDlp;
 
     juce::AudioFormatManager formatManager;
     juce::Random random;

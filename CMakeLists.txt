@@ -36,11 +36,12 @@ juce_add_plugin(CrateDig
     COPY_PLUGIN_AFTER_BUILD     FALSE
     VST3_CATEGORIES             Instrument Sampler
     AU_MAIN_TYPE                kAudioUnitType_MusicDevice
-    DESCRIPTION                 "Dig random vintage records and drag them into your DAW")
+    DESCRIPTION                 "Dig YouTube for samples and drag them into your DAW")
 
 set(CRATEDIG_CORE_SOURCES
     Source/Core/SampleInfo.cpp
-    Source/Core/ArchiveApi.cpp
+    Source/Core/YouTube.cpp
+    Source/Core/YtDlp.cpp
     Source/Core/Analysis.cpp
     Source/Core/Exporter.cpp)
 
@@ -83,7 +84,7 @@ if(CRATEDIG_BUILD_TESTS)
     target_sources(CrateDigTests PRIVATE
         ${CRATEDIG_CORE_SOURCES}
         Tests/TestMain.cpp
-        Tests/ArchiveApiTests.cpp
+        Tests/YouTubeTests.cpp
         Tests/AnalysisTests.cpp
         Tests/ExporterTests.cpp)
 
@@ -104,7 +105,7 @@ if(CRATEDIG_BUILD_TESTS)
     enable_testing()
     add_test(NAME CrateDigTests COMMAND CrateDigTests)
 
-    # Hits archive.org for real, so it is not registered with ctest.
+    # Runs yt-dlp against YouTube for real, so it is not registered with ctest.
     juce_add_console_app(CrateDigSmoke PRODUCT_NAME "CrateDigSmoke")
     target_sources(CrateDigSmoke PRIVATE ${CRATEDIG_CORE_SOURCES} Source/Core/Digger.cpp Tests/DigSmokeTest.cpp)
     target_include_directories(CrateDigSmoke PRIVATE Source)

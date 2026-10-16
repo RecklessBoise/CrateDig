@@ -30,14 +30,22 @@ juce::String sanitiseFileName (const juce::String& name, int maxLength)
 
 juce::String makeBaseName (const SampleInfo& info, double bpm, const juce::String& key)
 {
+    // YouTube auto-generated channels are called "Artist - Topic".
+    auto artist = info.channel.trim();
+
+    if (artist.endsWithIgnoreCase (" - Topic"))
+        artist = artist.dropLastCharacters (8).trim();
+
+    auto title = info.title.isNotEmpty() ? info.title : info.id;
     juce::String name;
 
-    if (info.creator.isNotEmpty())
-        name << info.creator.upToFirstOccurrenceOf (",", false, false).trim() << " - ";
+    // Uploads usually carry "Artist - Song" in the title already; only add the channel when they don't.
+    if (artist.isNotEmpty() && ! title.contains (" - ") && ! title.containsIgnoreCase (artist))
+        name << artist << " - ";
 
-    name << (info.title.isNotEmpty() ? info.title : info.identifier);
+    name << title;
 
-    if (info.year > 0)
+    if (info.year > 0 && ! title.contains (juce::String (info.year)))
         name << " (" << info.year << ")";
 
     juce::StringArray tags;

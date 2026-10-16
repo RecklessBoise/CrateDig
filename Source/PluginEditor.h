@@ -7,6 +7,8 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
+#include <map>
+
 class CrateDigEditor final : public juce::AudioProcessorEditor,
                              private juce::ChangeListener,
                              private juce::ListBoxModel,
@@ -27,41 +29,46 @@ private:
     // ChangeListener
     void changeListenerCallback (juce::ChangeBroadcaster*) override;
 
-    // ListBoxModel (dig history)
+    // ListBoxModel (search results or history)
     int getNumRows() override;
     void paintListBoxItem (int row, juce::Graphics&, int width, int height, bool selected) override;
     void listBoxItemClicked (int row, const juce::MouseEvent&) override;
+    void listBoxItemDoubleClicked (int row, const juce::MouseEvent&) override;
 
     void timerCallback() override;
 
     void refreshFromProcessor();
     void updateFiltersFromUi();
-    void showMessage (const juce::String& text, bool isError);
-    void saveWav();
     void applySizePreset (float factor);
+    void locateYtDlp();
+    void requestThumbnail (const cratedig::SampleInfo&);
+    const std::vector<cratedig::SampleInfo>& visibleList() const;
 
     CrateDigProcessor& crate;
     cratedig::ui::CrateLookAndFeel lookAndFeel;
     float scale = 1.0f;
 
     juce::TextButton sizeSmall { "S" }, sizeMedium { "M" }, sizeLarge { "L" };
+    juce::TextButton ytdlpButton { "yt-dlp..." };
     juce::TextButton openFolderButton { "Open folder" };
 
+    juce::TextEditor searchBox;
     juce::ComboBox genreBox, decadeBox;
-    juce::ToggleButton publicDomainToggle { "Public domain only" };
     juce::TextButton digButton { "DIG" };
 
-    juce::HyperlinkButton archiveLink { "archive.org", {} };
+    juce::HyperlinkButton youtubeLink { "Open on YouTube", {} };
     cratedig::ui::WaveformView waveform;
 
-    juce::TextButton playButton { "Play" };
+    juce::TextButton listenButton { "Listen" };
     juce::ToggleButton loopToggle { "Loop" };
     juce::Slider gainSlider { juce::Slider::LinearHorizontal, juce::Slider::NoTextBox };
 
     cratedig::ui::DragTile dragTile;
-    juce::TextButton saveButton { "Save WAV" };
+    juce::TextButton downloadButton { "Download" };
 
-    juce::ListBox historyList { "History", this };
+    juce::TextButton resultsTab { "Results" }, historyTab { "History" };
+    juce::ListBox list { "List", this };
+    bool showingHistory = false;
 
     juce::Label statusLabel;
     juce::TooltipWindow tooltips { this, 600 };
@@ -69,8 +76,15 @@ private:
     juce::AudioProcessorValueTreeState::ButtonAttachment loopAttachment;
     juce::AudioProcessorValueTreeState::SliderAttachment gainAttachment;
 
+    std::unique_ptr<juce::FileChooser> chooser;
+
+    // Thumbnails are fetched on a worker thread and cached per video id.
+    juce::ThreadPool thumbnailPool { 1 };
+    std::map<juce::String, juce::Image> thumbnails;
+    juce::StringArray requestedThumbnails;
+
     // Layout rectangles painted directly in paint().
-    juce::Rectangle<int> headerArea, infoArea, historyHeaderArea, gainLabelArea;
+    juce::Rectangle<int> headerArea, infoArea, thumbArea, listHeaderArea, gainLabelArea;
     int busyTicks = 0;
     const juce::AudioBuffer<float>* shownAudio = nullptr;
 

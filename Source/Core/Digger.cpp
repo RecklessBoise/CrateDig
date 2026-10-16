@@ -2,17 +2,50 @@
 
 #include "Analysis.h"
 
+#include <algorithm>
+
 namespace cratedig
 {
 
 namespace
 {
-    constexpr int maxDigAttempts = 8;
-    constexpr int connectionTimeoutMs = 15000;
+    constexpr int searchTimeoutMs = 45000;
+    constexpr int fetchTimeoutMs = 180000;
+    constexpr int maxSearchAttempts = 3;
+    constexpr int cachedPreviews = 20;
 
-    juce::String userAgentHeader()
+    /** yt-dlp's last line that names an existing file (its --print after_move:filepath output). */
+    juce::File lastPrintedFile (const juce::String& output)
     {
-        return "User-Agent: CrateDig/" CRATEDIG_VERSION " (+https://github.com/RecklessBoise/CrateDig)";
+        juce::StringArray lines;
+        lines.addLines (output);
+
+        for (int i = lines.size(); --i >= 0;)
+        {
+            auto line = lines[i].trim();
+
+            if (juce::File::isAbsolutePath (line))
+                if (juce::File f (line); f.existsAsFile())
+                    return f;
+        }
+
+        return {};
+    }
+
+    /** The most useful line of a yt-dlp failure. */
+    juce::String describeFailure (const YtDlp::Result& result)
+    {
+        if (result.timedOut)
+            return "yt-dlp timed out";
+
+        juce::StringArray lines;
+        lines.addLines (result.output);
+
+        for (auto& line : lines)
+            if (line.startsWith ("ERROR:"))
+                return "yt-dlp: " + line.fromFirstOccurrenceOf ("ERROR:", false, false).trim().substring (0, 160);
+
+        return "yt-dlp failed (exit code " + juce::String (result.exitCode) + ")";
     }
 } // namespace
 
@@ -27,42 +60,61 @@ Digger::~Digger()
     cancel();
 }
 
+void Digger::setCustomYtDlp (const juce::File& file)
+{
+    const juce::ScopedLock sl (jobLock);
+    customYtDlp = file;
+}
+
+juce::File Digger::getCustomYtDlp() const
+{
+    const juce::ScopedLock sl (jobLock);
+    return customYtDlp;
+}
+
+bool Digger::isYtDlpAvailable() const
+{
+    return YtDlp (getCustomYtDlp()).isAvailable();
+}
+
 juce::File Digger::cacheFolder()
 {
     return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
 #if JUCE_MAC
         .getChildFile ("Caches")
 #endif
-        .getChildFile ("CrateDig");
+        .getChildFile ("CrateDig")
+        .getChildFile ("Previews");
 }
 
 void Digger::cancel()
 {
-    stopThread (connectionTimeoutMs + 2000);
+    // The yt-dlp runner polls threadShouldExit, so this returns quickly.
+    stopThread (5000);
 }
 
-void Digger::dig (const archive::DigFilters& newFilters)
+void Digger::search (const youtube::DigFilters& newFilters)
 {
     if (isThreadRunning())
         return;
 
     {
         const juce::ScopedLock sl (jobLock);
-        job = Job::dig;
+        job = Job::search;
         filters = newFilters;
     }
 
     startThread();
 }
 
-void Digger::load (const SampleInfo& info)
+void Digger::fetch (const SampleInfo& info)
 {
-    if (isThreadRunning() || ! info.isValid())
+    if (isThreadRunning() || ! youtube::isValidVideoId (info.id))
         return;
 
     {
         const juce::ScopedLock sl (jobLock);
-        job = Job::load;
+        job = Job::fetch;
         requested = info;
     }
 
@@ -72,7 +124,7 @@ void Digger::load (const SampleInfo& info)
 void Digger::run()
 {
     Job currentJob;
-    archive::DigFilters currentFilters;
+    youtube::DigFilters currentFilters;
     SampleInfo info;
 
     {
@@ -82,22 +134,110 @@ void Digger::run()
         info = requested;
     }
 
-    if (currentJob == Job::dig)
-    {
-        auto found = findRandomRecord (currentFilters);
+    if (currentJob == Job::search)
+        runSearch (currentFilters);
+    else
+        runFetch (info);
+}
 
-        if (! found.has_value())
-            return; // error already posted (or cancelled)
+void Digger::runSearch (const youtube::DigFilters& searchFilters)
+{
+    YtDlp ytdlp (getCustomYtDlp());
 
-        info = *found;
-    }
-    else if (info.audioFile.isEmpty() && ! resolveAudioFile (info))
+    if (! ytdlp.isAvailable())
     {
-        postError ("Could not find audio for this record");
+        postError (YtDlp::installHint());
         return;
     }
 
-    auto loaded = fetchAndDecode (info);
+    auto isRandom = searchFilters.text.trim().isEmpty();
+    auto attempts = isRandom ? maxSearchAttempts : 1;
+
+    for (int attempt = 0; attempt < attempts && ! threadShouldExit(); ++attempt)
+    {
+        auto query = youtube::buildQuery (searchFilters, random);
+        postStatus ("Searching YouTube for \"" + query + "\"...");
+
+        auto result = ytdlp.run (youtube::buildSearchArgs (query), searchTimeoutMs, [this] { return threadShouldExit(); });
+
+        if (result.cancelled || threadShouldExit())
+            return;
+
+        auto found = youtube::parseSearchOutput (result.output);
+
+        if (found.empty() && ! result.succeeded())
+        {
+            postError (describeFailure (result));
+            return;
+        }
+
+        std::vector<SampleInfo> tracks;
+        std::copy_if (found.begin(), found.end(), std::back_inserter (tracks), youtube::looksLikeTrack);
+
+        if (tracks.empty())
+            continue;
+
+        if (isRandom)
+        {
+            // Shuffle so the first card is a surprise, like digging through a crate.
+            for (auto i = tracks.size(); i > 1; --i)
+                std::swap (tracks[i - 1], tracks[(size_t) random.nextInt ((int) i)]);
+        }
+
+        juce::MessageManager::callAsync ([weak = weakSelf, query, tracks]
+        {
+            if (weak != nullptr && weak->onResults)
+                weak->onResults (query, tracks);
+        });
+        return;
+    }
+
+    if (! threadShouldExit())
+        postError (isRandom ? "Nothing usable found - dig again or change the filters"
+                            : "No tracks found for that search");
+}
+
+void Digger::runFetch (const SampleInfo& info)
+{
+    auto file = findCached (info);
+
+    if (! file.existsAsFile())
+    {
+        YtDlp ytdlp (getCustomYtDlp());
+
+        if (! ytdlp.isAvailable())
+        {
+            postError (YtDlp::installHint());
+            return;
+        }
+
+        auto folder = cacheFolder();
+        folder.createDirectory();
+        pruneCache (cachedPreviews);
+
+        postStatus ("Fetching audio for \"" + info.title + "\"...");
+
+        auto convertToWav = ytdlp.getFfmpeg().existsAsFile();
+        auto outputTemplate = folder.getChildFile (info.id + ".%(ext)s").getFullPathName();
+        auto result = ytdlp.run (youtube::buildAudioArgs (info.id, outputTemplate, convertToWav),
+                                 fetchTimeoutMs, [this] { return threadShouldExit(); });
+
+        if (result.cancelled || threadShouldExit())
+            return;
+
+        file = lastPrintedFile (result.output);
+
+        if (! file.existsAsFile())
+            file = findCached (info);
+
+        if (! file.existsAsFile())
+        {
+            postError (describeFailure (result));
+            return;
+        }
+    }
+
+    auto loaded = decode (info, file);
 
     if (! loaded.has_value() || threadShouldExit())
         return;
@@ -109,104 +249,23 @@ void Digger::run()
     });
 }
 
-std::optional<SampleInfo> Digger::findRandomRecord (const archive::DigFilters& digFilters)
+std::optional<LoadedSample> Digger::decode (const SampleInfo& info, const juce::File& file)
 {
-    auto range = archive::yearRange (digFilters);
-
-    if (range.isEmpty())
-    {
-        postError ("No public-domain records in that decade (only up to " + juce::String (archive::publicDomainLastYear) + ")");
-        return std::nullopt;
-    }
-
-    bool hadNetworkResponse = false;
-
-    for (int attempt = 0; attempt < maxDigAttempts && ! threadShouldExit(); ++attempt)
-    {
-        postStatus (attempt == 0 ? "Digging through the crates..." : "Still digging...");
-
-        auto year = range.first + random.nextInt (range.last - range.first + 1);
-        auto query = archive::buildQuery (digFilters, year);
-        auto& sorts = archive::sortOrders();
-        auto sort = sorts[random.nextInt (sorts.size())];
-
-        auto first = archive::parseSearchResponse (httpGet (archive::buildSearchUrl (query, 1, 1, sort)));
-
-        if (! first.has_value())
-            continue;
-
-        hadNetworkResponse = true;
-
-        if (first->numFound == 0)
-            continue;
-
-        auto offset = random.nextInt (juce::jmin (first->numFound, archive::maxSearchOffset));
-        auto page = offset == 0 ? first : archive::parseSearchResponse (httpGet (archive::buildSearchUrl (query, 1, offset + 1, sort)));
-
-        if (! page.has_value() || page->docs.empty())
-            continue;
-
-        auto info = page->docs.front();
-
-        if (! resolveAudioFile (info))
-            continue;
-
-        if (info.durationSeconds > archive::maxDurationSeconds)
-            continue;
-
-        return info;
-    }
-
-    if (! threadShouldExit())
-        postError (hadNetworkResponse ? "Nothing found with those filters - try widening them"
-                                      : "Cannot reach archive.org - check your connection");
-
-    return std::nullopt;
-}
-
-bool Digger::resolveAudioFile (SampleInfo& info)
-{
-    auto choice = archive::pickAudioFile (httpGet (archive::buildFilesUrl (info.identifier)));
-
-    if (! choice.has_value())
-        return false;
-
-    info.audioFile = choice->name;
-    info.durationSeconds = choice->durationSeconds;
-    return true;
-}
-
-std::optional<LoadedSample> Digger::fetchAndDecode (const SampleInfo& info)
-{
-    auto folder = cacheFolder();
-    folder.createDirectory();
-
-    auto cached = folder.getChildFile (juce::String::toHexString (info.identifier.hashCode64()) + ".mp3");
-
-    if (! cached.existsAsFile() || cached.getSize() == 0)
-    {
-        postStatus ("Downloading \"" + info.title + "\"...");
-
-        if (! download (info.downloadUrl(), cached))
-        {
-            if (! threadShouldExit())
-                postError ("Download failed");
-
-            return std::nullopt;
-        }
-    }
-
     postStatus ("Decoding...");
-    std::unique_ptr<juce::AudioFormatReader> reader (formatManager.createReaderFor (cached));
+    std::unique_ptr<juce::AudioFormatReader> reader (formatManager.createReaderFor (file));
 
     if (reader == nullptr)
     {
-        cached.deleteFile();
-        postError ("Could not decode the audio file");
+        file.deleteFile();
+       #if JUCE_WINDOWS
+        postError ("Could not decode this audio - install ffmpeg so yt-dlp can convert it to WAV");
+       #else
+        postError ("Could not decode this audio");
+       #endif
         return std::nullopt;
     }
 
-    auto maxSamples = (juce::int64) (reader->sampleRate * archive::maxDurationSeconds);
+    auto maxSamples = (juce::int64) (reader->sampleRate * youtube::maxDurationSeconds);
     auto numSamples = (int) juce::jmin (reader->lengthInSamples, maxSamples);
     auto numChannels = (int) juce::jlimit (1u, 2u, reader->numChannels);
 
@@ -235,88 +294,38 @@ std::optional<LoadedSample> Digger::fetchAndDecode (const SampleInfo& info)
     if (result.info.durationSeconds <= 0.0)
         result.info.durationSeconds = numSamples / reader->sampleRate;
 
+    file.setLastModificationTime (juce::Time::getCurrentTime()); // keeps recently used previews when pruning
     return result;
 }
 
-juce::String Digger::httpGet (const juce::String& url)
+bool Digger::isCached (const SampleInfo& info)
 {
-    int status = 0;
-    auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
-                       .withConnectionTimeoutMs (connectionTimeoutMs)
-                       .withExtraHeaders (userAgentHeader())
-                       .withNumRedirectsToFollow (5)
-                       .withStatusCode (&status);
+    return findCached (info).existsAsFile();
+}
 
-    if (auto stream = juce::URL (url).createInputStream (options))
-        if (status < 400)
-            return stream->readEntireStreamAsString();
+juce::File Digger::findCached (const SampleInfo& info)
+{
+    if (! youtube::isValidVideoId (info.id))
+        return {};
+
+    for (auto& file : cacheFolder().findChildFiles (juce::File::findFiles, false, info.id + ".*"))
+        if (file.getFileExtension() != ".part" && file.getSize() > 0)
+            return file;
 
     return {};
 }
 
-bool Digger::download (const juce::String& url, const juce::File& destination)
+void Digger::pruneCache (int filesToKeep)
 {
-    int status = 0;
-    auto options = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
-                       .withConnectionTimeoutMs (connectionTimeoutMs)
-                       .withExtraHeaders (userAgentHeader())
-                       .withNumRedirectsToFollow (8)
-                       .withStatusCode (&status);
+    auto files = cacheFolder().findChildFiles (juce::File::findFiles, false);
 
-    auto stream = juce::URL (url).createInputStream (options);
-
-    if (stream == nullptr || status >= 400)
-        return false;
-
-    auto partial = destination.withFileExtension ("part");
-    partial.deleteFile();
-
+    std::sort (files.begin(), files.end(), [] (const juce::File& a, const juce::File& b)
     {
-        juce::FileOutputStream out (partial);
+        return a.getLastModificationTime() > b.getLastModificationTime();
+    });
 
-        if (out.failedToOpen())
-            return false;
-
-        constexpr int chunkSize = 1 << 16;
-        juce::HeapBlock<char> buffer (chunkSize);
-        auto total = stream->getTotalLength();
-        juce::int64 received = 0;
-        auto lastReport = juce::Time::getMillisecondCounter();
-
-        while (! stream->isExhausted())
-        {
-            if (threadShouldExit())
-            {
-                out.flush();
-                partial.deleteFile();
-                return false;
-            }
-
-            auto n = stream->read (buffer, chunkSize);
-
-            if (n <= 0)
-                break;
-
-            out.write (buffer, (size_t) n);
-            received += n;
-
-            if (total > 0 && juce::Time::getMillisecondCounter() - lastReport > 250)
-            {
-                lastReport = juce::Time::getMillisecondCounter();
-                postStatus ("Downloading... " + juce::String ((int) (100 * received / total)) + "%");
-            }
-        }
-
-        out.flush();
-
-        if (received == 0 || (total > 0 && received < total))
-        {
-            partial.deleteFile();
-            return false;
-        }
-    }
-
-    return partial.moveFileTo (destination);
+    for (int i = filesToKeep; i < files.size(); ++i)
+        files.getReference (i).deleteFile();
 }
 
 void Digger::postStatus (const juce::String& message)
