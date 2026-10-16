@@ -1,0 +1,107 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  macos:
+    name: macOS (AU + VST3, universal)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -G Xcode -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+
+      - name: Build
+        run: cmake --build build --config $BUILD_TYPE --target CrateDig_AU CrateDig_VST3 CrateDig_Standalone CrateDigTests -- -quiet
+
+      - name: Unit tests
+        run: ./build/CrateDigTests_artefacts/$BUILD_TYPE/CrateDigTests
+
+      - name: Ad-hoc sign
+        run: |
+          ART=build/CrateDig_artefacts/$BUILD_TYPE
+          codesign --force --deep --sign - "$ART/AU/CrateDig.component"
+          codesign --force --deep --sign - "$ART/VST3/CrateDig.vst3"
+          codesign --force --deep --sign - "$ART/Standalone/CrateDig.app"
+
+      - name: Validate AU (auval)
+        run: |
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          cp -R build/CrateDig_artefacts/$BUILD_TYPE/AU/CrateDig.component ~/Library/Audio/Plug-Ins/Components/
+          killall -9 AudioComponentRegistrar || true
+          auval -v aumu Cdg1 Crdg
+
+      - name: Validate VST3 + AU (pluginval)
+        run: |
+          curl -sL -o pluginval.zip https://github.com/Tracktion/pluginval/releases/download/v1.0.4/pluginval_macOS.zip
+          unzip -q pluginval.zip
+          ./pluginval.app/Contents/MacOS/pluginval --strictness-level 5 --skip-gui-tests --validate-in-process \
+            --validate build/CrateDig_artefacts/$BUILD_TYPE/VST3/CrateDig.vst3
+
+      - name: Package
+        run: |
+          ART=build/CrateDig_artefacts/$BUILD_TYPE
+          mkdir -p dist
+          ditto -c -k --keepParent "$ART/AU/CrateDig.component" dist/CrateDig-macOS-AU.zip
+          ditto -c -k --keepParent "$ART/VST3/CrateDig.vst3" dist/CrateDig-macOS-VST3.zip
+          ditto -c -k --keepParent "$ART/Standalone/CrateDig.app" dist/CrateDig-macOS-Standalone.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CrateDig-macOS
+          path: dist/*.zip
+
+  windows:
+    name: Windows (VST3)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --target CrateDig_VST3 CrateDig_Standalone CrateDigTests
+
+      - name: Unit tests
+        run: build\CrateDigTests_artefacts\Release\CrateDigTests.exe
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path build\CrateDig_artefacts\Release\VST3\CrateDig.vst3 -DestinationPath dist\CrateDig-Windows-VST3.zip
+          Compress-Archive -Path build\CrateDig_artefacts\Release\Standalone\CrateDig.exe -DestinationPath dist\CrateDig-Windows-Standalone.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CrateDig-Windows
+          path: dist/*.zip
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true
